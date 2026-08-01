@@ -1,0 +1,23 @@
+[
+  {
+    "service": "checkout",
+    "severity": "critical",
+    "summary": "latency spike",
+    "timestamp": "2026-08-02T10:00:00Z",
+    "source": "prometheus"
+  },
+  {
+    "service": "checkout",
+    "severity": "warning",
+    "summary": "db connection pool saturation",
+    "timestamp": "2026-08-02T10:01:00Z",
+    "source": "elk"
+  },
+  {
+    "service": "payments",
+    "severity": "critical",
+    "summary": "payment gateway timeout",
+    "timestamp": "2026-08-02T10:02:00Z",
+    "source": "prometheus"
+  }
+]
