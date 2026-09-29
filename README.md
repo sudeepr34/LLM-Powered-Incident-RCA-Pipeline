@@ -1,87 +1,156 @@
-# LLM-Powered Incident RCA Pipeline
+# Incident RCA Pipeline
 
-This workspace contains a production-oriented MVP for an incident RCA pipeline. It correlates alerts from Prometheus and ELK-style sources, normalizes them into a consistent schema, clusters related incidents, and generates draft runbook recommendations for on-call engineers.
+Takes Prometheus / ELK alerts, groups them into service clusters, ranks the
+clusters the way you'd triage on call, and drafts the first runbook steps.
+Optionally sends the correlated structure to an LLM for a readable summary.
 
-## Architecture
+When something breaks you get twenty alerts from six services in a minute, and
+most of them are the same failure from different angles. Sorting origin from
+collateral is the slow part of the first five minutes.
 
-- Ingestion layer: accepts alert payloads from Prometheus and ELK-like sources
-- Normalization layer: converts service, severity, and summary fields into a common shape
-- Correlation layer: groups alerts by service and highlights the highest-impact cluster
-- Summarization layer: emits a structured incident summary and draft recommendations
-- Extension layer: supports future integration with an external LLM provider through a pluggable adapter
+## Behaviour
 
-## Configuration
+- **Severity over volume** — one `critical` outranks five `warning`s. Tie-break
+  is which cluster started alerting first.
+- **Correlation window** — clusters that start within
+  `RCA_CORRELATION_WINDOW_SECONDS` (default 900) of the first alert are one
+  incident. Anything later is tagged `separate`, not silently merged.
+- **Advice from the alert text** — recommendations match signals that are
+  actually present (latency, connection errors, 5xx, resource pressure,
+  cert/auth, replication).
+- **LLM is optional and never required** — timeout, HTTP error, bad JSON,
+  empty response, or missing key all fall back to the deterministic summary.
 
-You can tune runtime behavior through environment variables such as:
+## Example
 
-- RCA_LOG_LEVEL
-- RCA_DEFAULT_SOURCE
-- RCA_ENABLE_LLM
-- RCA_LLM_PROVIDER
-- RCA_LLM_MODEL
-- RCA_LLM_API_KEY
-- RCA_DB_PASSWORD
-- RCA_DATABASE_URL
+`POST /api/ingest` with [`sample_alerts.json`](sample_alerts.json), then
+`POST /api/analyze`:
 
-For local development, place sensitive values in a separate .env file and keep it out of source control. The app will load it automatically.
-
-## Guardrails and operational safety
-
-The application now includes several guardrails to make it safer for real use:
-
-- Input validation: alert payloads reject empty service names, excessive lengths, and unexpected fields.
-- Oversized ingestion protection: bulk ingestion rejects payloads larger than 100 items with HTTP 413.
-- Empty analysis protection: RCA analysis returns HTTP 404 when there are no stored alerts to analyze.
-- Structured logging: key API events and errors are logged with context for easier troubleshooting.
-- CORS middleware: the API is prepared for browser-based clients while still being restricted by default.
-
-## Detailed documentation by section
-
-### 1. Ingestion layer
-The ingestion layer accepts either a single alert or a Prometheus/ELK-style payload and normalizes it into a common shape before persistence.
-
-### 2. Analysis layer
-The analysis layer groups alerts by service, builds a summary, and drafts recommendations. It can later be extended with an external LLM provider when enabled.
-
-### 3. Storage layer
-The storage layer persists alerts and RCA outputs in a SQLite database by default, but it can be pointed to another database using RCA_DATABASE_URL.
-
-### 4. HTTP API
-The HTTP API exposes health checks, alert ingestion, bulk ingestion, and RCA analysis. Each route is validated and guarded with operational safety checks.
-
-### 5. Configuration and secrets
-All runtime behavior is driven by environment variables. Sensitive values should be placed in a .env file or injected by your deployment platform.
-
-## Quick start
-
-```bash
-python3 -m app.main --sample
-python3 -m app.main sample_alerts.json
-python3 -m app.main --serve
+```jsonc
+{
+  "summary": "Incident detected across 2 service cluster(s) from elk, prometheus. The highest-impact service is checkout, with 3 alert(s) observed in total. Severities on checkout: critical, warning.",
+  "primary_service": "checkout",
+  "alert_count": 3,
+  "window_seconds": 120.0,
+  "llm_provider": "offline",
+  "clusters": [
+    {
+      "service": "checkout",
+      "alert_count": 2,
+      "severities": ["critical", "warning"],
+      "summary": "latency spike; db connection pool saturation",
+      "impact_score": 10,
+      "offset_seconds": 0.0,
+      "correlation": "origin"
+    },
+    {
+      "service": "payments",
+      "alert_count": 1,
+      "severities": ["critical"],
+      "summary": "payment gateway timeout",
+      "offset_seconds": 120.0,
+      "correlation": "correlated"
+    }
+  ],
+  "recommendations": [
+    "Start with checkout: review its dashboard, recent deploys, and SLO burn rate over the alert window.",
+    "Latency is in the signal: check dependency response times and connection pool saturation before assuming the service itself is at fault.",
+    "Treat payments as possibly downstream of checkout; confirm before paging those owners separately."
+  ]
+}
 ```
 
-## Containerization
+## LLM summary
 
-This environment uses Podman rather than Docker Compose, so the recommended startup command is:
+Off by default. Enable with `RCA_ENABLE_LLM=true`:
+
+| Provider | Endpoint | Notes |
+| --- | --- | --- |
+| `offline` | none | Default. No network. |
+| `ollama` | `http://localhost:11434/api/chat` | Local model, no egress. |
+| `openai` | `{RCA_LLM_BASE_URL}/chat/completions` | Any OpenAI-compatible API (OpenAI, Groq, vLLM, LM Studio, …). |
 
 ```bash
-./scripts/run-podman.sh
+RCA_ENABLE_LLM=true RCA_LLM_PROVIDER=ollama RCA_LLM_MODEL=llama3.1 \
+  python -m app.main --sample
+
+RCA_ENABLE_LLM=true RCA_LLM_PROVIDER=openai \
+  RCA_LLM_BASE_URL=http://vllm.internal:8000/v1 \
+  RCA_LLM_API_KEY=... python -m app.main --sample
 ```
 
-Then use:
+Retries with backoff for 408/429/5xx and transport errors. A 401 is not
+retried.
 
-- http://localhost:8000/health
-- POST http://localhost:8000/alerts
-- POST http://localhost:8000/analyze
+Prompts are redacted before leaving the process (`RCA_LLM_REDACT=true`): IPs,
+emails, AWS keys, JWTs, UUIDs, hashes, and `key=value` secrets. Key *names*
+are kept so the model can still reason about "an auth token failed".
 
-## What it does
+```
+api_key=sk_live_abc123def456  ->  api_key=[SECRET]
+timeout from 10.0.0.5         ->  timeout from [IP]
+```
 
-- Ingests alert payloads from Prometheus/ELK-like sources
-- Groups related alerts into service clusters
-- Produces a human-readable RCA summary
-- Drafts actionable runbook recommendations
-- Supports structured logging and extension points for future production integration
+## API
 
-## Verification
+```
+GET  /api/health
+GET  /api/config
+POST /api/alerts
+POST /api/ingest
+POST /api/analyze
+```
 
-The implementation has been exercised directly with Python and produced a valid RCA summary, cluster output, and recommendation list.
+`/api/ingest` accepts Alertmanager, Elasticsearch (`hits.hits` / `_source`),
+and plain lists. Timestamps: ISO 8601, epoch seconds, or milliseconds.
+
+Guardrails: `extra="forbid"`, 100-item ingest cap (413), 404 from `/analyze`
+when empty, field length limits.
+
+## Run
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+
+python -m app.main --sample
+python -m app.main sample_alerts.json
+python -m app.main --serve
+pytest -q                    # 44 tests
+```
+
+```bash
+./scripts/run-podman.sh      # SQLite volume
+docker compose up --build    # API + Postgres (waits on pg_isready)
+```
+
+## Layout
+
+```
+app/analysis/rca.py           cluster / correlate / recommend
+app/analysis/llm_adapter.py   offline / openai / ollama
+app/analysis/redaction.py     prompt scrubbing
+app/ingestion/normalize.py    Prometheus / ELK shapes
+app/storage/                  SQLAlchemy store
+app/http/                     FastAPI routes
+app/core/                     settings + models
+```
+
+## Testing
+
+44 tests, no network. LLM providers use an injected stub client that records
+the outgoing request, so request shape and auth headers are pinned and every
+failure path is covered. Live OpenAI/Ollama calls are not part of CI — the
+`offline` path is what runs end to end locally.
+
+## Limitations
+
+- Clustering is by service name only — no dependency graph
+- Advice is keyword-matched, not diagnosed
+- No dedup of repeated firings of the same alert
+- No auth; CORS is open for local use
+- LLM summary is a draft — edit before it goes in a postmortem
+
+## License
+
+MIT — see [LICENSE](LICENSE).

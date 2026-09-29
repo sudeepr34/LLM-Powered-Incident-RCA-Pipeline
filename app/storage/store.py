@@ -3,12 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from sqlalchemy import Column, Integer, String
-from sqlalchemy.orm import declarative_base
-
 from app.storage.database import SessionLocal
-
-Base = declarative_base()
 
 
 class AlertStore:

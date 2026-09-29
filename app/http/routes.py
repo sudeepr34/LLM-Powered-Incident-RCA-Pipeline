@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field, ConfigDict
 
 from app.analysis.rca import analyze_incident
+from app.core.config import get_settings
 from app.ingestion.normalize import normalize_payload
 from app.storage.store import AlertStore
 
@@ -82,6 +83,24 @@ def analyze() -> dict[str, Any]:
     logger.info("Completed RCA analysis with %d clusters", len(result.clusters))
     return {
         "summary": result.summary,
+        "primary_service": result.primary_service,
+        "alert_count": result.alert_count,
+        "window_seconds": result.window_seconds,
+        "llm_provider": result.llm_provider,
         "clusters": result.clusters,
         "recommendations": result.recommendations,
+    }
+
+
+@router.get("/config", summary="Report the active analysis configuration")
+def config() -> dict[str, Any]:
+    """Which summariser is live, without exposing the API key."""
+    settings = get_settings()
+    return {
+        "llm_enabled": settings.enable_llm,
+        "llm_provider": settings.llm_provider if settings.enable_llm else "offline",
+        "llm_model": settings.llm_model,
+        "llm_redaction": settings.llm_redact,
+        "api_key_configured": bool(settings.llm_api_key),
+        "correlation_window_seconds": settings.correlation_window_seconds,
     }
